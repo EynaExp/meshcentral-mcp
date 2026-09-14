@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import crypto from 'crypto';
 import https from 'https';
 import http from 'http';
+import { FileTunnel } from './file-tunnel.js';
 
 export class MeshCentralClient {
   #ws = null;
@@ -75,6 +76,12 @@ export class MeshCentralClient {
         try { handler(msg); } catch {}
       }
     }
+    // 4) Wildcard handler (used by waitForMessage)
+    if (this.#messageHandlers.has('_any')) {
+      for (const handler of this.#messageHandlers.get('_any')) {
+        try { handler(msg); } catch {}
+      }
+    }
   }
 
   async connect() {
@@ -87,15 +94,9 @@ export class MeshCentralClient {
         rejectUnauthorized: this.#config.rejectUnauthorized,
       });
 
-      const usernameB64 = Buffer.from(this.#config.username).toString('base64');
-      const passwordB64 = Buffer.from(this.#config.password).toString('base64');
-      const meshAuth = `${usernameB64},${passwordB64}`;
-
       this.#ws = new WebSocket(wsUrl, {
         agent: urlObj.protocol === 'https:' ? agent : undefined,
-        headers: {
-          'x-meshauth': meshAuth,
-        },
+        headers: this.#meshAuthHeaders(),
       });
 
       this.#ws.on('open', () => {
@@ -221,6 +222,84 @@ export class MeshCentralClient {
         reject(err);
       }
     });
+  }
+
+  sendRaw(command) {
+    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+      throw new Error('Not connected to MeshCentral');
+    }
+    this.#ws.send(JSON.stringify(command));
+  }
+
+  // Wait for a specific message (e.g. clipboard data routed back as {action:'msg', type:'getclip'})
+  waitForMessage(matchFn, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      const handler = (msg) => {
+        let ok = false;
+        try { ok = matchFn(msg); } catch {}
+        if (ok) {
+          clearTimeout(timer);
+          off();
+          resolve(msg);
+        }
+      };
+      const timer = setTimeout(() => { off(); reject(new Error('Timed out waiting for message')); }, timeoutMs);
+      const off = this.on('_any', handler);
+    });
+  }
+
+  // Open a remote file tunnel (meshrelay.ashx p=5) to a device
+  async openFileTunnel(nodeid, timeoutMs = 25000) {
+    // 1. Request an auth cookie for the tunnel
+    const cookieResp = await this.sendCommand({ action: 'getcookie', nodeid }, 15000);
+    if (!cookieResp.cookie) throw new Error('Server did not return a tunnel auth cookie');
+
+    // 2. Ask the agent to open the other end of the tunnel
+    // NOTE: nodeid and cookie are passed RAW (unencoded) - the agent escapes
+    // '$' and '@' itself before connecting (MeshCentral base64 alphabet uses those chars).
+    // The '*/' prefix tells the agent to resolve the path against its own server URL.
+    const tunnelId = crypto.randomBytes(16).toString('hex');
+    const query = `p=5&nodeid=${nodeid}&id=${tunnelId}&auth=${cookieResp.cookie}`;
+    this.sendRaw({ action: 'msg', type: 'tunnel', nodeid, value: `*/meshrelay.ashx?${query}` });
+
+    // 3. Connect the user side of the tunnel
+    const urlObj = new URL(this.#config.serverUrl);
+    const wsProtocol = urlObj.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${wsProtocol}//${urlObj.host}/meshrelay.ashx?${query}`;
+    const agent = urlObj.protocol === 'https:'
+      ? new https.Agent({ rejectUnauthorized: this.#config.rejectUnauthorized })
+      : undefined;
+
+    const ws = new WebSocket(wsUrl, {
+      agent,
+      headers: this.#meshAuthHeaders(),
+    });
+
+    // Wait for 'c' (both tunnel ends joined), then select file protocol
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        try { ws.close(); } catch {}
+        reject(new Error('File tunnel setup timed out (is the device online?)'));
+      }, timeoutMs);
+      ws.on('message', (data) => {
+        const s = data.toString();
+        if (s === 'c' || s === 'cr') {
+          clearTimeout(timer);
+          ws.send('5'); // protocol 5 = remote files
+          resolve();
+        }
+      });
+      ws.on('error', (err) => { clearTimeout(timer); reject(new Error(`Tunnel error: ${err.message}`)); });
+      ws.on('close', () => { clearTimeout(timer); reject(new Error('Tunnel closed before setup completed')); });
+    });
+
+    return new FileTunnel(ws);
+  }
+
+  #meshAuthHeaders() {
+    const usernameB64 = Buffer.from(this.#config.username).toString('base64');
+    const passwordB64 = Buffer.from(this.#config.password).toString('base64');
+    return { 'x-meshauth': `${usernameB64},${passwordB64}` };
   }
 
   disconnect() {

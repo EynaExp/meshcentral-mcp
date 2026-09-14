@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import fs from 'fs';
+import path from 'path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -296,27 +298,6 @@ server.tool(
   }
 );
 
-// ── mesh_file_list ─────────────────────────────────────────────────────
-server.tool(
-  'mesh_file_list',
-  'List files and folders on a remote device (like the file manager in MeshCentral web UI).',
-  {
-    node_id: z.string().describe('Device node ID'),
-    path: z.string().optional().describe('Directory path to list (e.g. "C:\\\\" on Windows, "/" on Linux)'),
-  },
-  async ({ node_id, path }) => {
-    const listPath = path || '';
-    const res = await meshClient.sendCommand({
-      action: 'runcommands',
-      nodeids: [node_id],
-      cmds: `JSON.stringify(typeof fs === "object" ? {entries: fs.readdirSync("${listPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}") } : "fs not available")`,
-      type: 4,
-      reply: true,
-    }, 15000);
-    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
-  }
-);
-
 // ── mesh_power_action ───────────────────────────────────────────────────
 server.tool(
   'mesh_power_action',
@@ -476,6 +457,593 @@ server.tool(
   },
   async ({ iprange }) => {
     const res = await meshClient.sendCommand({ action: 'scanamtdevice', iprange }, 30000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// FILE OPERATIONS (via meshrelay.ashx p=5 tunnels)
+// ════════════════════════════════════════════════════════════════════════
+
+async function withFileTunnel(node_id, fn) {
+  const tunnel = await meshClient.openFileTunnel(node_id);
+  try {
+    return await fn(tunnel);
+  } finally {
+    tunnel.close();
+  }
+}
+
+// ── mesh_file_list ─────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_list',
+  'List files and folders on a remote device (uses the same tunnel as the MeshCentral file manager).',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    path: z.string().describe('Directory path (e.g. "C:\\\\" on Windows, "/" on Linux)'),
+  },
+  async ({ node_id, path: dirPath }) => {
+    try {
+      const dir = await withFileTunnel(node_id, (t) => t.list(dirPath));
+      return { content: [{ type: 'text', text: JSON.stringify(dir, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_read ─────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_read',
+  'Read a file from a remote device and return its content. Binary files are returned as base64. Use mesh_file_download for large files.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    file_path: z.string().describe('Full path of the file to read'),
+    max_kb: z.number().optional().describe('Max size to read in KB (default 512, max 2048)'),
+  },
+  async ({ node_id, file_path, max_kb }) => {
+    const maxBytes = Math.min(max_kb ?? 512, 2048) * 1024;
+    try {
+      const data = await withFileTunnel(node_id, (t) => t.download(file_path));
+      if (data.length > maxBytes) {
+        return { content: [{ type: 'text', text: `File is ${data.length} bytes (max ${maxBytes}). Use mesh_file_download to save it locally instead.` }], isError: true };
+      }
+      // Try UTF-8; if it contains many nulls/non-printables, return base64
+      const text = data.toString('utf8');
+      const printable = text.split('').filter(c => c.charCodeAt(0) >= 9 && c.charCodeAt(0) !== 65533).length / text.length;
+      if (printable > 0.95) {
+        return { content: [{ type: 'text', text: text }] };
+      }
+      return { content: [{ type: 'text', text: `[BINARY FILE, ${data.length} bytes, base64]\n${data.toString('base64')}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_download ─────────────────────────────────────────────────
+server.tool(
+  'mesh_file_download',
+  'Download a file from a remote device to a local path on the machine running this MCP server.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    remote_path: z.string().describe('Full path of the file on the remote device'),
+    local_path: z.string().describe('Local destination path'),
+  },
+  async ({ node_id, remote_path, local_path: localPath }) => {
+    try {
+      const data = await withFileTunnel(node_id, (t) => t.download(remote_path));
+      fs.writeFileSync(localPath, data);
+      return { content: [{ type: 'text', text: `Downloaded ${data.length} bytes from ${remote_path} to ${localPath}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_write ────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_write',
+  'Write text or base64 content to a file on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    file_path: z.string().describe('Full destination path on the remote device'),
+    content: z.string().describe('Content to write'),
+    encoding: z.enum(['utf8', 'base64']).optional().describe('Content encoding (default utf8)'),
+  },
+  async ({ node_id, file_path, content, encoding }) => {
+    try {
+      const data = encoding === 'base64' ? Buffer.from(content, 'base64') : Buffer.from(content, 'utf8');
+      const dir = path.dirname(file_path).replace(/\\/g, '/');
+      const name = path.basename(file_path);
+      await withFileTunnel(node_id, (t) => t.upload(dir, name, data));
+      return { content: [{ type: 'text', text: `Wrote ${data.length} bytes to ${file_path}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_upload ───────────────────────────────────────────────────
+server.tool(
+  'mesh_file_upload',
+  'Upload a local file to a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    local_path: z.string().describe('Local file to upload'),
+    remote_dir: z.string().describe('Destination directory on the remote device'),
+    remote_name: z.string().optional().describe('Destination filename (default: same as local)'),
+  },
+  async ({ node_id, local_path: localPath, remote_dir: remoteDir, remote_name }) => {
+    try {
+      const data = fs.readFileSync(localPath);
+      const name = remote_name || path.basename(localPath);
+      await withFileTunnel(node_id, (t) => t.upload(remoteDir, name, data));
+      return { content: [{ type: 'text', text: `Uploaded ${localPath} (${data.length} bytes) to ${remoteDir}${remoteDir.endsWith('/') || remoteDir.endsWith('\\') ? '' : '/'}${name}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_delete ───────────────────────────────────────────────────
+server.tool(
+  'mesh_file_delete',
+  'Delete files or folders on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    path: z.string().describe('Parent directory containing the files'),
+    names: z.array(z.string()).describe('File/folder names to delete (relative to path)'),
+    recursive: z.boolean().optional().describe('Recursive delete for folders (default false)'),
+  },
+  async ({ node_id, path: dirPath, names, recursive }) => {
+    try {
+      await withFileTunnel(node_id, (t) => t.delete(dirPath, names, recursive ?? false));
+      return { content: [{ type: 'text', text: `Deleted ${JSON.stringify(names)} from ${dirPath}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_mkdir ────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_mkdir',
+  'Create a directory on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    path: z.string().describe('Full path of the directory to create'),
+  },
+  async ({ node_id, path: dirPath }) => {
+    try {
+      await withFileTunnel(node_id, (t) => t.mkdir(dirPath));
+      return { content: [{ type: 'text', text: `Created directory ${dirPath}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_rename ───────────────────────────────────────────────────
+server.tool(
+  'mesh_file_rename',
+  'Rename (or move within the same directory) a file or folder on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    path: z.string().describe('Parent directory'),
+    old_name: z.string().describe('Current name'),
+    new_name: z.string().describe('New name'),
+  },
+  async ({ node_id, path: dirPath, old_name, new_name }) => {
+    try {
+      await withFileTunnel(node_id, (t) => t.rename(dirPath, old_name, new_name));
+      return { content: [{ type: 'text', text: `Renamed ${old_name} to ${new_name} in ${dirPath}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_copy ─────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_copy',
+  'Copy files between directories on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    source_dir: z.string().describe('Source directory'),
+    dest_dir: z.string().describe('Destination directory'),
+    names: z.array(z.string()).describe('File names to copy (relative to source_dir)'),
+  },
+  async ({ node_id, source_dir, dest_dir, names }) => {
+    try {
+      await withFileTunnel(node_id, (t) => t.copy(source_dir, dest_dir, names));
+      return { content: [{ type: 'text', text: `Copied ${JSON.stringify(names)} from ${source_dir} to ${dest_dir}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_move ─────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_move',
+  'Move files between directories on a remote device.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    source_dir: z.string().describe('Source directory'),
+    dest_dir: z.string().describe('Destination directory'),
+    names: z.array(z.string()).describe('File names to move (relative to source_dir)'),
+  },
+  async ({ node_id, source_dir, dest_dir, names }) => {
+    try {
+      await withFileTunnel(node_id, (t) => t.move(source_dir, dest_dir, names));
+      return { content: [{ type: 'text', text: `Moved ${JSON.stringify(names)} from ${source_dir} to ${dest_dir}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_file_find ─────────────────────────────────────────────────────
+server.tool(
+  'mesh_file_find',
+  'Search for files on a remote device by name filter.',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    path: z.string().describe('Directory to search in'),
+    filter: z.string().describe('Filename filter (e.g. "*.log")'),
+  },
+  async ({ node_id, path: dirPath, filter }) => {
+    try {
+      const results = await withFileTunnel(node_id, (t) => t.find(dirPath, filter));
+      return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// DETAIL GATHERING
+// ════════════════════════════════════════════════════════════════════════
+
+// ── mesh_get_sysinfo ───────────────────────────────────────────────────
+server.tool(
+  'mesh_get_sysinfo',
+  'Get full hardware/system info for a device (CPU, RAM, disks/volumes, BIOS, OS details, Defender status). Data is collected by the agent and stored server-side.',
+  {
+    node_id: z.string().describe('Device node ID'),
+  },
+  async ({ node_id }) => {
+    const res = await meshClient.sendCommand({ action: 'getsysinfo', nodeid: node_id }, 20000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_get_network_info ──────────────────────────────────────────────
+server.tool(
+  'mesh_get_network_info',
+  'Get network interface information for a device (MACs, IPs, gateways, DNS, WiFi).',
+  {
+    node_id: z.string().describe('Device node ID'),
+  },
+  async ({ node_id }) => {
+    const res = await meshClient.sendCommand({ action: 'getnetworkinfo', nodeid: node_id }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_get_power_timeline ────────────────────────────────────────────
+server.tool(
+  'mesh_get_power_timeline',
+  'Get the power state history for a device (on/off/sleep timeline).',
+  {
+    node_id: z.string().describe('Device node ID'),
+  },
+  async ({ node_id }) => {
+    const res = await meshClient.sendCommand({ action: 'powertimeline', nodeid: node_id }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_get_lastconnects ──────────────────────────────────────────────
+server.tool(
+  'mesh_get_lastconnects',
+  'Get the last connection times for all devices the user can see.',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'lastconnects' }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_get_clipboard ─────────────────────────────────────────────────
+server.tool(
+  'mesh_get_clipboard',
+  'Read the clipboard content of a remote device (requires agent online).',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+  },
+  async ({ node_id }) => {
+    try {
+      // Ask the agent for its clipboard, then wait for the routed response
+      meshClient.sendRaw({ action: 'getClip', nodeid: node_id });
+      const res = await meshClient.waitForMessage(
+        (msg) => msg.action === 'msg' && msg.type === 'getclip' && (msg.nodeid === node_id || msg.nodeid === undefined),
+        12000
+      );
+      return { content: [{ type: 'text', text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+  }
+);
+
+// ── mesh_set_clipboard ─────────────────────────────────────────────────
+server.tool(
+  'mesh_set_clipboard',
+  'Set the clipboard content on a remote device (requires agent online).',
+  {
+    node_id: z.string().describe('Device node ID (must be online)'),
+    data: z.string().describe('Text to place on the clipboard'),
+  },
+  async ({ node_id, data }) => {
+    try { meshClient.sendRaw({ action: 'setClip', nodeid: node_id, data }); } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+    return { content: [{ type: 'text', text: 'Clipboard set (fire-and-forget, verify with mesh_get_clipboard)' }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// USERS & PERMISSIONS
+// ════════════════════════════════════════════════════════════════════════
+
+// ── mesh_add_user_to_group ─────────────────────────────────────────────
+server.tool(
+  'mesh_add_user_to_group',
+  'Grant a user access to a device group with specific rights. Rights bitmask: 1=editMesh, 2=manageUsers, 4=manageComputers, 8=remoteControl, 16=agentConsole, 32=remoteCommand, 64=resetOff, 128=remoteViewOnly, 256=notes, 512=desktop, 1024=terminal, 2048=files, 4096=amt, 8192=httpUrl, 16384=share, 32768=wakeDevice, 65536=details.',
+  {
+    user_id: z.string().describe('User ID or username'),
+    mesh_id: z.string().describe('Device group ID'),
+    rights: z.number().describe('Rights bitmask (4294967295 = full admin)'),
+  },
+  async ({ user_id, mesh_id, rights }) => {
+    const res = await meshClient.sendCommand({
+      action: 'addmeshuser',
+      meshid: mesh_id,
+      userids: [user_id],
+      meshadmin: rights,
+    }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_remove_user_from_group ────────────────────────────────────────
+server.tool(
+  'mesh_remove_user_from_group',
+  'Remove a user\'s access to a device group.',
+  {
+    user_id: z.string().describe('User ID or username'),
+    mesh_id: z.string().describe('Device group ID'),
+  },
+  async ({ user_id, mesh_id }) => {
+    const res = await meshClient.sendCommand({
+      action: 'addmeshuser',
+      meshid: mesh_id,
+      userids: [user_id],
+      meshadmin: 0,
+      remove: true,
+    }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_add_device_user ───────────────────────────────────────────────
+server.tool(
+  'mesh_add_device_user',
+  'Grant a user direct access to a single device (device-level link).',
+  {
+    node_id: z.string().describe('Device node ID'),
+    user_id: z.string().describe('User ID or username'),
+    rights: z.number().describe('Rights bitmask (bits 0-2 not allowed for device links)'),
+    remove: z.boolean().optional().describe('Set true to remove the link'),
+  },
+  async ({ node_id, user_id, rights, remove }) => {
+    const res = await meshClient.sendCommand({
+      action: 'adddeviceuser',
+      nodeid: node_id,
+      userids: [user_id],
+      rights,
+      ...(remove ? { remove: true } : {}),
+    }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_edit_group ────────────────────────────────────────────────────
+server.tool(
+  'mesh_edit_group',
+  'Edit a device group name or description.',
+  {
+    mesh_id: z.string().describe('Device group ID'),
+    name: z.string().optional().describe('New group name'),
+    description: z.string().optional().describe('New description'),
+  },
+  async ({ mesh_id, name, description }) => {
+    const cmd = { action: 'editmesh', meshid: mesh_id };
+    if (name) cmd.meshname = name;
+    if (description !== undefined) cmd.desc = description;
+    const res = await meshClient.sendCommand(cmd, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_create_user_group ─────────────────────────────────────────────
+server.tool(
+  'mesh_create_user_group',
+  'Create a user group (for batch-managing permissions).',
+  {
+    name: z.string().describe('User group name'),
+    description: z.string().optional().describe('Description'),
+  },
+  async ({ name, description }) => {
+    const cmd = { action: 'createusergroup', name };
+    if (description) cmd.desc = description;
+    const res = await meshClient.sendCommand(cmd, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_delete_user_group ─────────────────────────────────────────────
+server.tool(
+  'mesh_delete_user_group',
+  'Delete a user group.',
+  {
+    ugrp_id: z.string().describe('User group ID (ugrp/...)'),
+  },
+  async ({ ugrp_id }) => {
+    const res = await meshClient.sendCommand({ action: 'deleteusergroup', ugrpid: ugrp_id }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_list_user_groups ──────────────────────────────────────────────
+server.tool(
+  'mesh_list_user_groups',
+  'List all user groups.',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'usergroups' }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// AGENT MANAGEMENT
+// ════════════════════════════════════════════════════════════════════════
+
+// ── mesh_uninstall_agent ───────────────────────────────────────────────
+server.tool(
+  'mesh_uninstall_agent',
+  'Uninstall the MeshCentral agent from a device.',
+  {
+    node_id: z.string().describe('Device node ID'),
+  },
+  async ({ node_id }) => {
+    const res = await meshClient.sendCommand({ action: 'uninstallagent', nodeid: node_id }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_create_invite_link ────────────────────────────────────────────
+server.tool(
+  'mesh_create_invite_link',
+  'Create an agent installation invite link for a device group.',
+  {
+    mesh_id: z.string().describe('Device group ID'),
+    expire_hours: z.number().optional().describe('Link expiry in hours (default 8)'),
+    flags: z.number().optional().describe('Invite flags (0=installation link)'),
+  },
+  async ({ mesh_id, expire_hours, flags }) => {
+    const res = await meshClient.sendCommand({
+      action: 'createInviteLink',
+      meshid: mesh_id,
+      expire: expire_hours ?? 8,
+      flags: flags ?? 0,
+    }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_distribute_core ───────────────────────────────────────────────
+server.tool(
+  'mesh_distribute_core',
+  'Push a new agent core to devices (default=recover core, clear, recovery, tiny).',
+  {
+    node_ids: z.array(z.string()).describe('Device node IDs'),
+    type: z.enum(['default', 'clear', 'recovery', 'tiny']).describe('Core type'),
+  },
+  async ({ node_ids, type }) => {
+    try { meshClient.sendRaw({ action: 'uploadagentcore', nodeids: node_ids, type }); } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+    return { content: [{ type: 'text', text: `Core '${type}' distribution requested for ${node_ids.length} device(s)` }] };
+  }
+);
+
+// ── mesh_update_agents ─────────────────────────────────────────────────
+server.tool(
+  'mesh_update_agents',
+  'Request agents on a device to update to the latest version.',
+  {
+    node_id: z.string().describe('Device node ID'),
+  },
+  async ({ node_id }) => {
+    try { meshClient.sendRaw({ action: 'updatedevices', nodeids: [node_id] }); } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
+    return { content: [{ type: 'text', text: 'Agent update requested' }] };
+  }
+);
+
+// ════════════════════════════════════════════════════════════════════════
+// SERVER ADMINISTRATION
+// ════════════════════════════════════════════════════════════════════════
+
+// ── mesh_server_stats ──────────────────────────────────────────────────
+server.tool(
+  'mesh_server_stats',
+  'Get MeshCentral server statistics (connections, memory, traffic).',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'serverstats' }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_server_errors ─────────────────────────────────────────────────
+server.tool(
+  'mesh_server_errors',
+  'Get the MeshCentral server error log.',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'servererrors' }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_server_version ────────────────────────────────────────────────
+server.tool(
+  'mesh_server_version',
+  'Get the MeshCentral server version info.',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'serverversion' }, 15000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_server_console ────────────────────────────────────────────────
+server.tool(
+  'mesh_server_console',
+  'Run a server console command on MeshCentral (like the "My Server" console in the web UI). Examples: "heap", "dispatchtable", "agentstats", "dbstats", "certexpire", "args", "usersessions".',
+  {
+    command: z.string().describe('Server console command to run'),
+  },
+  async ({ command }) => {
+    const res = await meshClient.sendCommand({ action: 'serverconsole', value: command }, 20000);
+    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+  }
+);
+
+// ── mesh_traffic_stats ─────────────────────────────────────────────────
+server.tool(
+  'mesh_traffic_stats',
+  'Get server traffic statistics.',
+  {},
+  async () => {
+    const res = await meshClient.sendCommand({ action: 'trafficstats' }, 15000);
     return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
   }
 );
