@@ -1,0 +1,111 @@
+# MeshCentral MCP Server
+
+A Model Context Protocol (MCP) server that lets AI assistants control your MeshCentral panel.
+
+## Features
+
+- List, search, and manage devices (nodes)
+- List and manage device groups (meshes)
+- Run remote commands on devices (CMD, PowerShell, Linux shell, Agent console)
+- Power actions (sleep, reset, poweroff, wake-on-LAN)
+- Send toast notifications to devices
+- Manage users (list, create, delete)
+- View events and audit logs
+- Device notes management
+- Move devices between groups
+- Intel AMT device scanning
+
+## Setup
+
+### 1. Install dependencies
+
+```bash
+cd meshcentral-mcp
+npm install
+```
+
+### 2. Configure MeshCentral credentials
+
+Copy `.env.example` to `.env` and fill in your server details:
+
+```bash
+cp .env.example .env
+```
+
+Or set environment variables directly:
+
+```bash
+MESH_SERVER_URL=https://mesh.yourdomain.com
+MESH_USERNAME=admin
+MESH_PASSWORD=yourpassword
+```
+
+### 3. MCP Client Configuration
+
+Add to your MCP client config (e.g. Claude Desktop `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "meshcentral": {
+      "command": "node",
+      "args": ["E:\\.RED team\\3.TOOLS\\MeshMCP\\meshcentral-mcp\\src\\index.js"],
+      "env": {
+        "MESH_SERVER_URL": "https://mesh.yourdomain.com",
+        "MESH_USERNAME": "admin",
+        "MESH_PASSWORD": "yourpassword"
+      }
+    }
+  }
+}
+```
+
+For **opencode**, add to your `opencode.json`:
+
+```json
+{
+  "mcpServers": {
+    "meshcentral": {
+      "command": "node",
+      "args": ["E:\\.RED team\\3.TOOLS\\MeshMCP\\meshcentral-mcp\\src\\index.js"],
+      "env": {
+        "MESH_SERVER_URL": "https://mesh.yourdomain.com",
+        "MESH_USERNAME": "admin",
+        "MESH_PASSWORD": "yourpassword"
+      }
+    }
+  }
+}
+```
+
+## Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `mesh_server_info` | Get server info and stats |
+| `mesh_list_devices` | List all devices, optionally by group |
+| `mesh_get_device` | Get device details |
+| `mesh_edit_device` | Edit device name, host, tags, ports |
+| `mesh_remove_device` | Remove a device |
+| `mesh_list_groups` | List device groups |
+| `mesh_create_group` | Create a device group |
+| `mesh_delete_group` | Delete a device group |
+| `mesh_run_command` | Run a command on a device |
+| `mesh_power_action` | Sleep, reset, poweroff, flash, vibrate |
+| `mesh_wake_devices` | Wake-on-LAN |
+| `mesh_send_toast` | Send notifications to devices |
+| `mesh_list_users` | List users |
+| `mesh_create_user` | Create a user |
+| `mesh_delete_user` | Delete a user |
+| `mesh_get_events` | Get audit events |
+| `mesh_get_notes` | Get device notes |
+| `mesh_set_notes` | Set device notes |
+| `mesh_change_device_group` | Move device to another group |
+| `mesh_scan_amt` | Scan for Intel AMT devices |
+
+## Security Notes
+
+- Store credentials in environment variables, never in code
+- Use `MESH_INSECURE_TLS=true` only for self-signed certificates in dev/lab environments
+- Consider using API tokens (`MESH_TOKEN`) instead of username/password for production use
+- The MCP server runs as your user with your MeshCentral permissions

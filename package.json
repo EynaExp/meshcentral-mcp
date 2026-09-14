@@ -1,0 +1,17 @@
+{
+  "name": "meshcentral-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for controlling MeshCentral panels",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "meshcentral-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "ws": "^8.18.2"
+  }
+}
