@@ -7,12 +7,14 @@ export class MeshCentralClient {
   #ws = null;
   #config;
   #pendingRequests = new Map();
+  #pendingByAction = new Map();
   #requestId = 0;
   #connected = false;
   #reconnectTimer = null;
   #messageHandlers = new Map();
   #serverNonce = null;
   #agentCert = null;
+  #intentionalClose = false;
 
   constructor(config) {
     this.#config = {
@@ -25,6 +27,56 @@ export class MeshCentralClient {
     };
   }
 
+  #sendUserAuth() {
+    const username = Buffer.from(this.#config.username).toString('base64');
+    const password = Buffer.from(this.#config.password).toString('base64');
+    this.#ws.send(JSON.stringify({
+      action: 'userAuth',
+      username,
+      password,
+    }));
+  }
+
+  #startMessageLoop() {}
+
+  #handleMessage(msg) {
+    // 1) Match by responseid (preferred)
+    if (msg.responseid && this.#pendingRequests.has(msg.responseid)) {
+      const pending = this.#pendingRequests.get(msg.responseid);
+      this.#pendingRequests.delete(msg.responseid);
+      clearTimeout(pending.timeout);
+      if (pending.actionEntry) {
+        const arr = this.#pendingByAction.get(pending.action);
+        if (arr) {
+          const idx = arr.indexOf(pending);
+          if (idx !== -1) arr.splice(idx, 1);
+          if (arr.length === 0) this.#pendingByAction.delete(pending.action);
+        }
+      }
+      pending.resolve(msg);
+      return;
+    }
+
+    // 2) Fallback: some server actions (meshes, users) don't echo responseid —
+    //    resolve the oldest pending request for the same action.
+    if (msg.action && this.#pendingByAction.has(msg.action)) {
+      const arr = this.#pendingByAction.get(msg.action);
+      const pending = arr.shift();
+      if (arr.length === 0) this.#pendingByAction.delete(msg.action);
+      this.#pendingRequests.delete(pending.responseid);
+      clearTimeout(pending.timeout);
+      pending.resolve(msg);
+      return;
+    }
+
+    // 3) Dispatch to registered handlers
+    if (msg.action && this.#messageHandlers.has(msg.action)) {
+      for (const handler of this.#messageHandlers.get(msg.action)) {
+        try { handler(msg); } catch {}
+      }
+    }
+  }
+
   async connect() {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(this.#config.serverUrl);
@@ -35,14 +87,23 @@ export class MeshCentralClient {
         rejectUnauthorized: this.#config.rejectUnauthorized,
       });
 
+      const usernameB64 = Buffer.from(this.#config.username).toString('base64');
+      const passwordB64 = Buffer.from(this.#config.password).toString('base64');
+      const meshAuth = `${usernameB64},${passwordB64}`;
+
       this.#ws = new WebSocket(wsUrl, {
         agent: urlObj.protocol === 'https:' ? agent : undefined,
-        headers: {},
+        headers: {
+          'x-meshauth': meshAuth,
+        },
       });
 
       this.#ws.on('open', () => {
         this.#connected = true;
         this.#startMessageLoop();
+        try {
+          this.#ws.send(JSON.stringify({ action: 'ping' }));
+        } catch {}
       });
 
       let authPhase = 0;
@@ -77,6 +138,14 @@ export class MeshCentralClient {
           return;
         }
 
+        if (!resolved && msg.action && msg.action !== 'close' && authPhase === 0) {
+          resolved = true;
+          this.#connected = true;
+          this.#handleMessage(msg);
+          resolve(msg);
+          return;
+        }
+
         this.#handleMessage(msg);
       });
 
@@ -94,56 +163,14 @@ export class MeshCentralClient {
           req.reject(new Error('Connection closed'));
         });
         this.#pendingRequests.clear();
-        this.#reconnectTimer = setTimeout(() => {
-          this.connect().catch(() => {});
-        }, 5000);
-      });
-
-      // Kick off inner auth
-      this.#ws.on('open', () => {
-        this.#ws.send(JSON.stringify({
-          action: 'x-meshauth',
-          value: '*',
-        }));
+        this.#pendingByAction.clear();
+        if (!this.#intentionalClose) {
+          this.#reconnectTimer = setTimeout(() => {
+            this.connect().catch(() => {});
+          }, 5000);
+        }
       });
     });
-  }
-
-  #sendUserAuth() {
-    const username = Buffer.from(this.#config.username).toString('base64');
-    const password = Buffer.from(this.#config.password).toString('base64');
-    this.#ws.send(JSON.stringify({
-      action: 'userAuth',
-      username,
-      password,
-    }));
-  }
-
-  #startMessageLoop() {}
-
-  #handleMessage(msg) {
-    // Handle response messages
-    if (msg.responseid && this.#pendingRequests.has(msg.responseid)) {
-      const pending = this.#pendingRequests.get(msg.responseid);
-      this.#pendingRequests.delete(msg.responseid);
-      clearTimeout(pending.timeout);
-      pending.resolve(msg);
-      return;
-    }
-
-    // Handle typed handlers
-    if (msg.action && this.#messageHandlers.has(msg.action)) {
-      for (const handler of this.#messageHandlers.get(msg.action)) {
-        try { handler(msg); } catch {}
-      }
-    }
-
-    // Handle event stream
-    if (msg.action === 'event') {
-      for (const handler of (this.#messageHandlers.get('event') || [])) {
-        try { handler(msg); } catch {}
-      }
-    }
   }
 
   on(action, handler) {
@@ -160,65 +187,51 @@ export class MeshCentralClient {
     }
 
     const responseId = `mcp_${++this.#requestId}`;
+    const action = command.action;
     const payload = { ...command, responseid: responseId };
 
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const pending = { responseid: responseId, action, resolve, reject };
+      pending.timeout = setTimeout(() => {
         this.#pendingRequests.delete(responseId);
-        reject(new Error(`Command timed out after ${timeoutMs}ms`));
+        if (this.#pendingByAction.has(action)) {
+          const arr = this.#pendingByAction.get(action);
+          const idx = arr.indexOf(pending);
+          if (idx !== -1) arr.splice(idx, 1);
+          if (arr.length === 0) this.#pendingByAction.delete(action);
+        }
+        reject(new Error(`Command '${action}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
-      this.#pendingRequests.set(responseId, { resolve, reject, timeout: timer });
+      this.#pendingRequests.set(responseId, pending);
+      if (!this.#pendingByAction.has(action)) this.#pendingByAction.set(action, []);
+      this.#pendingByAction.get(action).push(pending);
 
       try {
         this.#ws.send(JSON.stringify(payload));
       } catch (err) {
-        clearTimeout(timer);
+        clearTimeout(pending.timeout);
         this.#pendingRequests.delete(responseId);
-        reject(err);
-      }
-    });
-  }
-
-  async sendAndCollect(command, collectAction, collectTimeout = 30000) {
-    if (!this.#connected || !this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Not connected to MeshCentral');
-    }
-
-    return new Promise((resolve, reject) => {
-      const collected = [];
-      let off;
-      const timer = setTimeout(() => {
-        if (off) off();
-        if (collected.length === 0) {
-          reject(new Error('No response received'));
-        } else {
-          resolve(collected);
+        const arr = this.#pendingByAction.get(action);
+        if (arr) {
+          const idx = arr.indexOf(pending);
+          if (idx !== -1) arr.splice(idx, 1);
+          if (arr.length === 0) this.#pendingByAction.delete(action);
         }
-      }, collectTimeout);
-
-      off = this.on(collectAction, (msg) => {
-        collected.push(msg);
-      });
-
-      try {
-        this.#ws.send(JSON.stringify(command));
-      } catch (err) {
-        clearTimeout(timer);
-        if (off) off();
         reject(err);
       }
     });
   }
 
   disconnect() {
+    this.#intentionalClose = true;
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer);
       this.#reconnectTimer = null;
     }
     this.#connected = false;
     if (this.#ws) {
-      this.#ws.close();
+      try { this.#ws.close(); } catch {}
       this.#ws = null;
     }
   }
