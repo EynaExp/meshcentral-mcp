@@ -411,7 +411,7 @@ server.tool(
     node_id: z.string().describe('Device node ID'),
   },
   async ({ node_id }) => {
-    const res = await meshClient.sendCommand({ action: 'getNotes', nodeid: node_id }, 10000);
+    const res = await meshClient.sendCommand({ action: 'getNotes', id: node_id }, 10000);
     return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
   }
 );
@@ -425,8 +425,13 @@ server.tool(
     notes: z.string().describe('Notes text to set'),
   },
   async ({ node_id, notes }) => {
-    const res = await meshClient.sendCommand({ action: 'setNotes', nodeid: node_id, notes }, 10000);
-    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    try {
+      // setNotes never replies - fire and forget; verify with mesh_get_notes
+      meshClient.sendRaw({ action: 'setNotes', id: node_id, notes });
+      return { content: [{ type: 'text', text: 'Notes set (fire-and-forget, verify with mesh_get_notes)' }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
   }
 );
 
@@ -505,6 +510,9 @@ server.tool(
     const maxBytes = Math.min(max_kb ?? 512, 2048) * 1024;
     try {
       const data = await withFileTunnel(node_id, (t) => t.download(file_path));
+      if (data.length === 0) {
+        return { content: [{ type: 'text', text: '(empty file, 0 bytes)' }] };
+      }
       if (data.length > maxBytes) {
         return { content: [{ type: 'text', text: `File is ${data.length} bytes (max ${maxBytes}). Use mesh_file_download to save it locally instead.` }], isError: true };
       }
@@ -760,21 +768,21 @@ server.tool(
 // ── mesh_get_clipboard ─────────────────────────────────────────────────
 server.tool(
   'mesh_get_clipboard',
-  'Read the clipboard content of a remote device (requires agent online).',
+  'Read the clipboard content of a remote device (requires agent online and a clipboard module on the agent).',
   {
     node_id: z.string().describe('Device node ID (must be online)'),
   },
   async ({ node_id }) => {
     try {
-      // Ask the agent for its clipboard, then wait for the routed response
-      meshClient.sendRaw({ action: 'getClip', nodeid: node_id });
+      // Route via msg/getclip (adds sessionid so the response comes back to us); tag:3 suppresses audit logging
+      meshClient.sendRaw({ action: 'msg', type: 'getclip', nodeid: node_id, tag: 3 });
       const res = await meshClient.waitForMessage(
-        (msg) => msg.action === 'msg' && msg.type === 'getclip' && (msg.nodeid === node_id || msg.nodeid === undefined),
-        12000
+        (msg) => msg.action === 'msg' && msg.type === 'getclip' && msg.data !== undefined,
+        15000
       );
       return { content: [{ type: 'text', text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data) }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+      return { content: [{ type: 'text', text: `ERROR: ${err.message} (agent may be unable to read the clipboard, e.g. empty clipboard or missing clipboard module)` }], isError: true };
     }
   }
 );
@@ -788,10 +796,16 @@ server.tool(
     data: z.string().describe('Text to place on the clipboard'),
   },
   async ({ node_id, data }) => {
-    try { meshClient.sendRaw({ action: 'setClip', nodeid: node_id, data }); } catch (err) {
+    try {
+      meshClient.sendRaw({ action: 'msg', type: 'setclip', nodeid: node_id, data });
+      const res = await meshClient.waitForMessage(
+        (msg) => msg.action === 'msg' && msg.type === 'setclip' && msg.success !== undefined,
+        15000
+      );
+      return { content: [{ type: 'text', text: res.success ? 'Clipboard set successfully' : 'Setclip failed on device' }] };
+    } catch (err) {
       return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
     }
-    return { content: [{ type: 'text', text: 'Clipboard set (fire-and-forget, verify with mesh_get_clipboard)' }] };
   }
 );
 
@@ -980,7 +994,7 @@ server.tool(
     node_id: z.string().describe('Device node ID'),
   },
   async ({ node_id }) => {
-    try { meshClient.sendRaw({ action: 'updatedevices', nodeids: [node_id] }); } catch (err) {
+    try { meshClient.sendRaw({ action: 'updateAgents', nodeids: [node_id] }); } catch (err) {
       return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
     }
     return { content: [{ type: 'text', text: 'Agent update requested' }] };
@@ -997,8 +1011,16 @@ server.tool(
   'Get MeshCentral server statistics (connections, memory, traffic).',
   {},
   async () => {
-    const res = await meshClient.sendCommand({ action: 'serverstats' }, 15000);
-    return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    try {
+      // serverstats is a push subscription: request a 1s interval, take the first push, then stop
+      meshClient.sendRaw({ action: 'serverstats', interval: 1000 });
+      const res = await meshClient.waitForMessage((msg) => msg.action === 'serverstats' && msg.totalmem !== undefined, 15000);
+      try { meshClient.sendRaw({ action: 'serverstats' }); } catch {} // stop the timer
+      return { content: [{ type: 'text', text: JSON.stringify(res, null, 2) }] };
+    } catch (err) {
+      try { meshClient.sendRaw({ action: 'serverstats' }); } catch {} // stop the timer on failure too
+      return { content: [{ type: 'text', text: `ERROR: ${err.message}` }], isError: true };
+    }
   }
 );
 

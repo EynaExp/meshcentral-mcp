@@ -16,6 +16,7 @@ export class MeshCentralClient {
   #serverNonce = null;
   #agentCert = null;
   #intentionalClose = false;
+  #connecting = null;
 
   constructor(config) {
     this.#config = {
@@ -85,6 +86,21 @@ export class MeshCentralClient {
   }
 
   async connect() {
+    // Idempotent: if a connect is already in flight, await it instead of opening a second socket
+    if (this.#connecting) return this.#connecting;
+    if (this.#connected && this.#ws && this.#ws.readyState === WebSocket.OPEN) return;
+
+    this.#connecting = (async () => {
+      try {
+        await this.#doConnect();
+      } finally {
+        this.#connecting = null;
+      }
+    })();
+    return this.#connecting;
+  }
+
+  async #doConnect() {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(this.#config.serverUrl);
       const wsProtocol = urlObj.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -94,6 +110,7 @@ export class MeshCentralClient {
         rejectUnauthorized: this.#config.rejectUnauthorized,
       });
 
+      this.#intentionalClose = false;
       this.#ws = new WebSocket(wsUrl, {
         agent: urlObj.protocol === 'https:' ? agent : undefined,
         headers: this.#meshAuthHeaders(),
@@ -183,6 +200,10 @@ export class MeshCentralClient {
   }
 
   async sendCommand(command, timeoutMs = 30000) {
+    if (!this.#connected || !this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
+      // Attempt a single reconnect before failing
+      try { await this.connect(); } catch {}
+    }
     if (!this.#connected || !this.#ws || this.#ws.readyState !== WebSocket.OPEN) {
       throw new Error('Not connected to MeshCentral');
     }
